@@ -31,6 +31,18 @@ try:
 except Exception:  # pragma: no cover
     GoogleTranslator = None
 
+# ---- İskele altyapısı: loglama, crash handler, sürüm, otomatik güncelleme ----
+import crash_handler
+from logger import get_logger
+from version import __version__
+from updater import UpdateChecker, prompt_and_install
+
+# GitHub deposu (otomatik güncelleme buradan sürüm kontrol eder)
+GITHUB_USER = "thealps01-netizen"
+GITHUB_REPO = "lenslingo"
+
+_log = get_logger("main")
+
 
 # ============================ Tema / Renkler ==============================
 class C:
@@ -343,10 +355,19 @@ class ControlPanel(QWidget):
         self.box_overlay = None
         self.panel_overlay = None
 
-        self.setWindowTitle("LensLingo")
+        self.setWindowTitle(f"LensLingo v{__version__}")
         self.setMinimumWidth(400)
         self.setStyleSheet(self._qss())
         self._build()
+
+        # ── Açılışta arka planda güncelleme kontrolü (GitHub Releases) ──
+        self._update_checker = UpdateChecker(GITHUB_USER, GITHUB_REPO)
+        self._update_checker.update_available.connect(self._on_update_available)
+        self._update_checker.start()
+
+    def _on_update_available(self, tag, url, notes):
+        _log.info("Güncelleme bulundu: %s", tag)
+        prompt_and_install(tag, url, notes, parent=self)
 
     # --------------------------------------------------------------- QSS
     def _qss(self):
@@ -551,6 +572,9 @@ class ControlPanel(QWidget):
 
 
 def main():
+    crash_handler.install()   # global hata yakalayıcı (crash log + diyalog)
+    _log.info("LensLingo v%s başlatılıyor", __version__)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("LensLingo")
