@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# PyInstaller output (keep LensLingo.spec tracked)
+dist/
+build/
+installer/
+
+# Runtime / user data
+settings.json
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Windows
+Thumbs.db
+desktop.ini
