@@ -191,31 +191,32 @@ class OcrWorker(QThread):
 # ============================ Bölge seçici ================================
 class RegionSelector(QWidget):
     picked = pyqtSignal(int, int, int, int)  # logical: left, top, w, h
+    closed = pyqtSignal()                     # pencere kapandığında (panel'i geri göster)
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowState(Qt.WindowState.WindowFullScreen)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setGeometry(QGuiApplication.primaryScreen().geometry())
         self._start = None
         self._end = None
 
     def paintEvent(self, _e):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 90))
-        p.setPen(QPen(QColor(C.TEXT), 1))
+        # Tüm ekranı yarı saydam karart (canlı masaüstü altta görünür)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 110))
+        p.setPen(QPen(QColor(C.TEXT)))
         p.setFont(QFont("Segoe UI", 15, QFont.Weight.DemiBold))
         p.drawText(QRect(0, 30, self.width(), 40),
                    Qt.AlignmentFlag.AlignHCenter,
                    "Çevrilecek alanı fareyle sürükleyerek seç   ·   ESC = iptal")
-        if self._start and self._end:
+        if self._start is not None and self._end is not None:
             r = QRect(self._start, self._end).normalized()
-            # seçili alanı temizle (delik efekti)
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            p.fillRect(r, Qt.GlobalColor.transparent)
-            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            # Seçili alanı vurgula + cyan çerçeve
+            p.fillRect(r, QColor(0, 229, 255, 45))
             p.setPen(QPen(QColor(C.BOX), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(r)
@@ -223,6 +224,7 @@ class RegionSelector(QWidget):
     def mousePressEvent(self, e):
         self._start = e.position().toPoint()
         self._end = self._start
+        self.update()
 
     def mouseMoveEvent(self, e):
         self._end = e.position().toPoint()
@@ -231,13 +233,17 @@ class RegionSelector(QWidget):
     def mouseReleaseEvent(self, e):
         self._end = e.position().toPoint()
         r = QRect(self._start, self._end).normalized()
-        self.close()
         if r.width() > 10 and r.height() > 10:
             self.picked.emit(r.left(), r.top(), r.width(), r.height())
+        self.close()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
             self.close()
+
+    def closeEvent(self, e):
+        self.closed.emit()
+        super().closeEvent(e)
 
 
 # ============================ Kutu overlay ================================
@@ -464,8 +470,10 @@ class ControlPanel(QWidget):
         self.hide()
         self._sel = RegionSelector()
         self._sel.picked.connect(self._on_region)
-        self._sel.destroyed.connect(self.show)
+        self._sel.closed.connect(self.show)   # seçim bitince paneli geri getir
         self._sel.show()
+        self._sel.activateWindow()
+        self._sel.raise_()
 
     def _on_region(self, lx, ly, w, h):
         self.origin = (lx, ly)
@@ -539,12 +547,16 @@ class ControlPanel(QWidget):
             if w:
                 w.close()
         e.accept()
+        QApplication.instance().quit()   # kontrol paneli kapanınca uygulamadan çık
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("LensLingo")
+    # Bölge seçerken panel gizlenince/overlay kapanınca uygulama kendiliğinden
+    # kapanmasın; çıkışı yalnızca kontrol panelinin kapanması tetikler.
+    app.setQuitOnLastWindowClosed(False)
     panel = ControlPanel()
     panel.show()
     sys.exit(app.exec())
