@@ -23,7 +23,7 @@ from PyQt6.QtGui import (QColor, QPainter, QPen, QBrush, QFont, QFontMetrics,
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
                              QComboBox, QSlider, QCheckBox, QVBoxLayout,
                              QHBoxLayout, QFrame, QRadioButton, QButtonGroup,
-                             QGraphicsDropShadowEffect)
+                             QGraphicsDropShadowEffect, QScrollArea)
 
 # ---- Ağır import tembel yüklenir (uygulama hızlı açılsın diye) ----
 try:
@@ -85,7 +85,7 @@ TARGET_LANGS = {
 # ============================ Arka plan işçisi ============================
 class OcrWorker(QThread):
     boxes   = pyqtSignal(list)   # [(x1,y1,x2,y2,translated), ...] (logical px)
-    text    = pyqtSignal(str)    # panel modu için birleşik çeviri
+    pairs   = pyqtSignal(list)   # [(orijinal, çeviri), ...] — not modu
     status  = pyqtSignal(str, bool)  # (mesaj, hata_mi)
     stopped = pyqtSignal()
 
@@ -103,6 +103,7 @@ class OcrWorker(QThread):
         self.gpu = gpu
         self._running = True
         self._last_sig = None
+        self._own = set()   # kendi ürettiğimiz çeviriler (tekrar çevirmeyi önler)
 
     def stop(self):
         self._running = False
@@ -158,20 +159,34 @@ class OcrWorker(QThread):
                     time.sleep(0.5)
                     continue
 
+                if not self._running:
+                    break
+
                 dets = []
                 for det in results:
                     bbox, txt = det[0], det[1]
                     conf = det[2] if len(det) > 2 else 1.0
                     txt = (txt or "").strip()
-                    if txt and conf >= 0.35:
+                    # kendi çevirimizi ekrandan tekrar okuyup çevirmeyi önle
+                    if txt and conf >= 0.35 and txt not in self._own:
                         dets.append((bbox, txt))
+                # okuma sırası: yukarıdan aşağı, soldan sağa
+                dets.sort(key=lambda d: (min(p[1] for p in d[0]),
+                                         min(p[0] for p in d[0])))
 
-                if self.mode == "box":
+                if not dets:
+                    # Tarama boş döndü — son içeriği KORU (yanıp sönme/kaybolma olmasın)
+                    self.status.emit("Metin bekleniyor…", False)
+                elif self.mode == "box":
                     self._emit_boxes(dets, translator)
                 else:
-                    self._emit_panel(dets, translator)
+                    self._emit_pairs(dets, translator)
 
-                time.sleep(max(0.0, self.interval - (time.time() - t0)))
+                # kalan süreyi küçük parçalar halinde bekle (Durdur'a hızlı tepki)
+                remaining = self.interval - (time.time() - t0)
+                while remaining > 0 and self._running:
+                    time.sleep(min(0.1, remaining))
+                    remaining -= 0.1
         self.stopped.emit()
 
     def _emit_boxes(self, dets, translator):
@@ -187,17 +202,24 @@ class OcrWorker(QThread):
             x2 = self.ox + int(max(xs) / self.dpr)
             y1 = self.oy + int(min(ys) / self.dpr)
             y2 = self.oy + int(max(ys) / self.dpr)
-            items.append((x1, y1, x2, y2, self._translate(translator, txt)))
+            tr = self._translate(translator, txt)
+            self._own.add(tr)   # ekrana yazdığımızı tekrar çevirme
+            items.append((x1, y1, x2, y2, tr))
         self.boxes.emit(items)
         self.status.emit(f"{len(items)} metin çevrildi", False)
 
-    def _emit_panel(self, dets, translator):
-        text = " ".join(t for _, t in dets).strip()
-        if not text or text == self._last_sig:
+    def _emit_pairs(self, dets, translator):
+        sig = tuple(t for _, t in dets)
+        if sig == self._last_sig:        # ekran değişmedi → tekrar çizme
             return
-        self._last_sig = text
-        self.text.emit(self._translate(translator, text))
-        self.status.emit("Çeviriliyor…", False)
+        self._last_sig = sig
+        pairs = []
+        for _, txt in dets:
+            tr = self._translate(translator, txt)
+            self._own.add(tr)   # ekrana yazdığımızı tekrar çevirme
+            pairs.append((txt, tr))
+        self.pairs.emit(pairs)
+        self.status.emit(f"{len(pairs)} not güncellendi", False)
 
 
 # ============================ Bölge seçici ================================
@@ -309,37 +331,127 @@ class BoxOverlay(QWidget):
                        int(Qt.TextFlag.TextWordWrap), txt)
 
 
-# ============================ Panel overlay ==============================
-class PanelOverlay(QWidget):
-    """Sürüklenebilir, kenarlıksız tek çeviri paneli."""
+# ============================ Not penceresi ==============================
+class _DragBar(QFrame):
+    """Pencereyi başlık çubuğundan sürüklemek için."""
+    def __init__(self, win):
+        super().__init__()
+        self._win = win
+        self._drag = None
+
+    def mousePressEvent(self, e):
+        self._drag = e.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None:
+            self._win.move(e.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, _e):
+        self._drag = None
+
+
+class NotesWindow(QWidget):
+    """Ekranın sağında, yarı saydam, Yapışkan Notlar tarzı çeviri paneli.
+
+    Bulunan her yazı parçası bir kart olur: üstte renkli şerit, altında
+    orijinal metin ve çevirisi. İçerik yalnızca yeni bir tarama değişikliği
+    onaylanınca güncellenir (aradaki boş taramalarda kaybolmaz)."""
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowStaysOnTopHint |
                             Qt.WindowType.Tool)
-        self.setStyleSheet(f"""
-            QWidget {{ background:#0d1b2a; border:1px solid {C.ACCENT};
-                       border-radius:10px; }}
-            QLabel  {{ color:#ffffff; font:600 15px 'Segoe UI'; border:none; }}
-        """)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        self.label = QLabel("(çeviri burada görünecek)")
-        self.label.setWordWrap(True)
-        lay.addWidget(self.label)
-        self.resize(480, 90)
-        self._drag = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet(self._qss())
 
-    def set_text(self, t):
-        self.label.setText(t)
+        root = QVBoxLayout(self); root.setContentsMargins(0, 0, 0, 0)
+        card = QFrame(); card.setObjectName("NWCard"); root.addWidget(card)
+        cv = QVBoxLayout(card); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(0)
 
-    def mousePressEvent(self, e):
-        self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        # ── Başlık çubuğu (sürüklenebilir) ──
+        bar = _DragBar(self); bar.setObjectName("NWBar"); bar.setFixedHeight(46)
+        bh = QHBoxLayout(bar); bh.setContentsMargins(16, 0, 10, 0)
+        title = QLabel("Çeviri Notları"); title.setObjectName("NWTitle")
+        btn_close = QPushButton("✕"); btn_close.setObjectName("NWClose")
+        btn_close.setFixedSize(28, 28)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.hide)
+        bh.addWidget(title); bh.addStretch(); bh.addWidget(btn_close)
+        cv.addWidget(bar)
 
-    def mouseMoveEvent(self, e):
-        if self._drag is not None:
-            self.move(e.globalPosition().toPoint() - self._drag)
+        # ── Kaydırılabilir kart listesi ──
+        self._scroll = QScrollArea(); self._scroll.setObjectName("NWScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget(); inner.setObjectName("NWInner")
+        self._list = QVBoxLayout(inner)
+        self._list.setContentsMargins(12, 12, 12, 12); self._list.setSpacing(12)
+        self._list.addStretch()
+        self._scroll.setWidget(inner)
+        cv.addWidget(self._scroll)
+
+        self._empty = QLabel("Çeviri bekleniyor…")
+        self._empty.setObjectName("NWEmpty")
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._list.insertWidget(0, self._empty)
+
+    # ---- içerik ----
+    def set_pairs(self, pairs):
+        # eski kartları temizle (sondaki stretch hariç)
+        while self._list.count() > 1:
+            item = self._list.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for src, dst in pairs:
+            self._list.insertWidget(self._list.count() - 1, self._note(src, dst))
+
+    def _note(self, src, dst):
+        note = QFrame(); note.setObjectName("NWNote")
+        v = QVBoxLayout(note); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
+        strip = QFrame(); strip.setObjectName("NWStrip"); strip.setFixedHeight(4)
+        v.addWidget(strip)
+        body = QVBoxLayout(); body.setContentsMargins(14, 10, 14, 12); body.setSpacing(6)
+        s = QLabel(src); s.setObjectName("NWSrc"); s.setWordWrap(True)
+        d = QLabel(dst); d.setObjectName("NWDst"); d.setWordWrap(True)
+        body.addWidget(s); body.addWidget(d)
+        v.addLayout(body)
+        return note
+
+    # ---- yerleşim: ekranın sağına yasla ----
+    def dock_right(self):
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        w = 360
+        self.resize(w, scr.height() - 40)
+        self.move(scr.right() - w - 14, scr.top() + 20)
+
+    def _qss(self):
+        return f"""
+        #NWCard {{ background:rgba(16,18,24,225); border:1px solid {C.BORDER};
+                   border-radius:14px; }}
+        #NWBar {{ background:rgba(255,255,255,10);
+                  border-top-left-radius:14px; border-top-right-radius:14px;
+                  border-bottom:1px solid {C.BORDER}; }}
+        #NWTitle {{ color:{C.TEXT}; font:700 15px 'Segoe UI'; }}
+        #NWClose {{ background:transparent; color:{C.MUTED}; border:none;
+                    font-size:15px; border-radius:14px; padding:0; }}
+        #NWClose:hover {{ background:rgba(248,81,73,40); color:{C.ERR}; }}
+        #NWScroll, #NWInner {{ background:transparent; border:none; }}
+        #NWNote {{ background:rgba(32,36,46,235); border:1px solid {C.BORDER};
+                   border-radius:10px; }}
+        #NWStrip {{ background:{C.BOX};
+                    border-top-left-radius:10px; border-top-right-radius:10px; }}
+        #NWSrc {{ color:{C.MUTED}; font:400 12px 'Segoe UI'; }}
+        #NWDst {{ color:#ffffff; font:600 15px 'Segoe UI'; }}
+        #NWEmpty {{ color:{C.MUTED}; font:400 13px 'Segoe UI'; padding:28px; }}
+        QScrollBar:vertical {{ background:transparent; width:9px; margin:4px 2px; }}
+        QScrollBar::handle:vertical {{ background:{C.BORDER}; border-radius:4px;
+                    min-height:30px; }}
+        QScrollBar::handle:vertical:hover {{ background:{C.ACCENT}; }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
+        QScrollBar::add-page, QScrollBar::sub-page {{ background:transparent; }}
+        """
 
 
 # ============================ Kontrol paneli =============================
@@ -437,11 +549,11 @@ class ControlPanel(QWidget):
         # 2) Görünüm modu
         c2, v2 = self._card("2 · GÖRÜNÜM")
         self.grp = QButtonGroup(self)
-        self.rb_box = QRadioButton("🔲  Kutu modu — her yazıyı işaretle, altına çevir")
-        self.rb_panel = QRadioButton("🪟  Panel modu — hepsini tek pencerede göster")
-        self.rb_box.setChecked(True)
-        self.grp.addButton(self.rb_box); self.grp.addButton(self.rb_panel)
-        v2.addWidget(self.rb_box); v2.addWidget(self.rb_panel)
+        self.rb_panel = QRadioButton("🗒️  Not modu — sağda yapışkan not paneli (önerilen)")
+        self.rb_box = QRadioButton("🔲  Kutu modu — yazıyı ekranda işaretle (deneysel)")
+        self.rb_panel.setChecked(True)
+        self.grp.addButton(self.rb_panel); self.grp.addButton(self.rb_box)
+        v2.addWidget(self.rb_panel); v2.addWidget(self.rb_box)
         root.addWidget(c2)
 
         # 3) Diller
@@ -517,15 +629,23 @@ class ControlPanel(QWidget):
 
         mode = "box" if self.rb_box.isChecked() else "panel"
         if mode == "box":
+            if self.panel_overlay:            # diğer modun panelini gizle
+                self.panel_overlay.hide()
             if self.box_overlay is None:
                 self.box_overlay = BoxOverlay()
             self.box_overlay.clear(); self.box_overlay.show()
         else:
+            if self.box_overlay:              # diğer modun overlay'ini gizle
+                self.box_overlay.hide()
             if self.panel_overlay is None:
-                self.panel_overlay = PanelOverlay()
-            lx, ly = self.origin
-            self.panel_overlay.move(lx, ly + self.region_phys["height"] // int(self.dpr) + 12)
+                self.panel_overlay = NotesWindow()
+            self.panel_overlay.dock_right()
             self.panel_overlay.show()
+            self.panel_overlay.raise_()
+
+        # çalışırken mod değiştirilemesin (karışıklık olmasın)
+        self.rb_box.setEnabled(False)
+        self.rb_panel.setEnabled(False)
 
         self.worker = OcrWorker(
             self, self.region_phys, self.origin, self.dpr,
@@ -533,7 +653,7 @@ class ControlPanel(QWidget):
             TARGET_LANGS[self.cmb_target.currentText()],
             mode, self.sld.value() / 10, self.chk_gpu.isChecked())
         self.worker.boxes.connect(lambda it: self.box_overlay and self.box_overlay.set_items(it))
-        self.worker.text.connect(lambda t: self.panel_overlay and self.panel_overlay.set_text(t))
+        self.worker.pairs.connect(lambda ps: self.panel_overlay and self.panel_overlay.set_pairs(ps))
         self.worker.status.connect(self._status)
         self.worker.stopped.connect(self._on_stopped)
         self.worker.start()
@@ -546,15 +666,19 @@ class ControlPanel(QWidget):
     def stop(self):
         if self.worker:
             self.worker.stop()
+            self._status("Durduruluyor…")
 
     def _on_stopped(self):
         self.worker = None
         if self.box_overlay:
-            self.box_overlay.clear()
+            self.box_overlay.clear(); self.box_overlay.hide()
+        # not paneli açık kalsın (son çeviriler okunabilsin)
         self.btn_toggle.setText("▶  Çeviriyi Başlat")
         self.btn_toggle.setObjectName("Primary")
         self.btn_toggle.setStyleSheet(self._qss())
         self.btn_region.setEnabled(True)
+        self.rb_box.setEnabled(True)
+        self.rb_panel.setEnabled(True)
         self._status("Durduruldu.")
 
     def _status(self, msg, err=False):

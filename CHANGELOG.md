@@ -6,6 +6,20 @@ Biçim [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) temellidir ve
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-08
+### Added
+- Yeni **Not modu** (varsayılan): ekranın sağında, yarı saydam, Yapışkan Notlar
+  tarzı panel. Bulunan her yazı parçası ayrı kart olur (orijinal + altında çeviri).
+
+### Changed
+- Kutu modu ikincil/deneysel seçenek oldu.
+
+### Fixed
+- Kendi çevirimizi ekrandan tekrar okuyup çevirme (geri besleme döngüsü) önlendi.
+- Boş/geçici taramalarda içerik kaybolmuyor; yalnızca değişiklik onaylanınca güncelleniyor.
+- "Durdur" artık anında tepki veriyor (uzun bekleme parçalara bölündü).
+- Çalışırken mod kilitleniyor; mod değişince diğer modun paneli ekranda kalmıyor.
+
 ## [0.1.1] - 2026-08-08
 ### Added
 - Açılışta arka planda otomatik güncelleme kontrolü (GitHub Releases) bağlandı;
